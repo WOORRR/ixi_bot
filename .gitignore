@@ -8,6 +8,7 @@ service-account*.json
 *-sa-key.json
 ixibot_v0.2_claude_code_지침서.md
 ixibot_v0.193_기획서_v0.2 확정.md
+ixibot_v0.2_작업내역.md
 __pycache__/
 *.pyc
 .pytest_cache/
