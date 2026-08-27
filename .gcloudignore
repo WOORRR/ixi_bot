@@ -1,15 +1,22 @@
+# Cloud Run --source 배포 시 업로드 제외 목록
+# ⚠️ 민감 파일 — 절대 업로드 금지
 .env
-reports.jsonl
-
-# 민감 파일 — 절대 커밋 금지 (저장소는 공개)
 user_list_Sql.txt
 *.serviceaccount.json
 service-account*.json
 *-sa-key.json
 ixibot_v0.2_claude_code_지침서.md
 ixibot_v0.193_기획서_v0.2 확정.md
+
+# 불필요 파일
+.git
+.gitignore
+.gcloudignore
 __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
 venv/
+reports.jsonl
+tests/
+docs/

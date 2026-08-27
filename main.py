@@ -1,93 +1,83 @@
-"""IxiBot v0.1 — 텔레그램 오류 증상 보고 수집 봇 (long polling).
+"""IxiBot v0.2 — 텔레그램 오류 증상 보고 수집 봇 (지침서 §4-5).
 
-/start (또는 딥링크 t.me/woorrr_ixi_bot?start=report)
-  → [📝 증상 보고하기] 키보드 버튼 (Mini App 폼 열기)
-  → 폼 제출(web_app_data) 수신 → 서버 측 재검증 → JSONL 기록 → 확인 메시지
+- WEBHOOK_URL 설정 시: Cloud Run webhook 모드 (PTB run_webhook 이 secret_token 검증까지 수행)
+- 미설정 시: long polling (로컬 개발 폴백)
+
+온보딩(연락처 자동 매칭/실명 폴백) → 승인 사용자만 Mini App 폼으로 보고 →
+Firestore reports 에 usr_id 귀속 기록.
 """
 
 import logging
+import os
+from urllib.parse import urlparse
 
-from telegram import KeyboardButton, ReplyKeyboardMarkup, Update, WebAppInfo
+from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
     filters,
 )
 
-from config import BOT_TOKEN, FORM_URL
-from storage import save_report
-from validation import validate_report
+import admin
+import onboarding
+import reports
+from config import BOT_TOKEN, FORM_URL, WEBHOOK_SECRET, WEBHOOK_URL
 
 logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO
 )
-# httpx의 polling 요청 로그는 너무 시끄러우므로 낮춘다
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("ixibot")
 
+# chat_member 가 빠지면 그룹 입장 감지가 조용히 실패한다 — 반드시 포함 (§4-5)
+ALLOWED_UPDATES = ["message", "callback_query", "chat_member"]
 
-def form_keyboard() -> ReplyKeyboardMarkup:
-    """Mini App 폼을 여는 키보드 버튼.
 
-    주의: sendData는 ReplyKeyboardMarkup의 web_app 버튼으로 열었을 때만
-    봇에 전달된다 (인라인 버튼 사용 금지 — 기획서 §5 주의점).
-    """
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("📝 증상 보고하기", web_app=WebAppInfo(url=FORM_URL))]],
-        resize_keyboard=True,
-        is_persistent=True,
+def build_application() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    private = filters.ChatType.PRIVATE
+
+    app.add_handler(CommandHandler("start", onboarding.start, filters=private))
+    app.add_handler(CommandHandler("pending", admin.cmd_pending))
+    app.add_handler(CommandHandler("users", admin.cmd_users))
+    app.add_handler(CommandHandler("revoke", admin.cmd_revoke))
+    app.add_handler(CommandHandler("unbind", admin.cmd_unbind))
+    app.add_handler(CommandHandler("whoami", admin.cmd_whoami))
+
+    app.add_handler(ChatMemberHandler(onboarding.on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.CONTACT & private, onboarding.handle_contact))
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.WEB_APP_DATA, reports.handle_web_app_data)
     )
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "안녕하세요, IxiBot입니다 🙂\n"
-        "서비스 이용 중 겪은 오류 증상을 수집하고 있어요.\n\n"
-        "아래 [📝 증상 보고하기] 버튼을 누르면 보고 폼이 열립니다.\n"
-        "여러 번 제출하셔도 됩니다.",
-        reply_markup=form_keyboard(),
+    # 실명 폴백 — join_requests.state == awaiting_name 일 때만 내부에서 반응
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & private, onboarding.handle_text)
     )
-
-
-async def handle_web_app_data(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    message = update.effective_message
-    user = update.effective_user
-    raw = message.web_app_data.data
-    logger.info("web_app_data 수신 (user_id=%s): %s", user.id if user else "?", raw)
-
-    result = validate_report(raw)
-    if not result.ok:
-        logger.warning("검증 실패 (user_id=%s): %s", user.id if user else "?", result.error)
-        await message.reply_text(
-            f"제출 내용에 문제가 있어 접수하지 못했습니다 ❌\n"
-            f"사유: {result.error}\n\n"
-            "아래 버튼을 눌러 다시 작성해 주세요.",
-            reply_markup=form_keyboard(),
-        )
-        return
-
-    report = result.report
-    save_report(report, telegram_user_id=user.id if user else None)
-    await message.reply_text(
-        "접수되었습니다 ✅\n"
-        f"👤 {report['name']} / 🕐 {report['symptom_time']}\n"
-        f"📝 {report['symptom_text']}",
-        reply_markup=form_keyboard(),
-    )
+    app.add_handler(CallbackQueryHandler(admin.handle_callback))
+    return app
 
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(
-        MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data)
-    )
-    logger.info("IxiBot polling 시작 — 폼 URL: %s", FORM_URL)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app = build_application()
+
+    if WEBHOOK_URL:
+        url_path = urlparse(WEBHOOK_URL).path.lstrip("/")
+        logger.info("IxiBot webhook 모드 시작 — 폼 URL: %s", FORM_URL)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get("PORT", 8080)),
+            url_path=url_path,
+            secret_token=WEBHOOK_SECRET,
+            webhook_url=WEBHOOK_URL,
+            allowed_updates=ALLOWED_UPDATES,
+        )
+    else:
+        logger.info("IxiBot polling 모드 시작 (로컬 개발) — 폼 URL: %s", FORM_URL)
+        app.run_polling(allowed_updates=ALLOWED_UPDATES)
 
 
 if __name__ == "__main__":
